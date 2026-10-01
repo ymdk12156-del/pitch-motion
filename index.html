@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pitch Motion Web</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#f4f5f7;color:#1f2937}
+main{max-width:920px;margin:auto;padding:18px}.card{background:#fff;border-radius:16px;padding:18px;margin:14px 0;box-shadow:0 2px 12px #00000012}
+h1{margin:0 0 6px;font-size:25px}h2{font-size:18px}
+#stage{position:relative;display:block;width:100%;background:#111;border-radius:12px;overflow:hidden}
+video{display:block;width:100%;max-height:65vh;object-fit:contain}canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button{border:0;border-radius:10px;padding:11px 15px;background:#111;color:#fff;font-size:15px}
+button:disabled{opacity:.45}input[type=file]{max-width:100%}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}.metric{background:#f7f7f8;border-radius:10px;padding:12px}
+.metric b{font-size:20px}.muted{color:#6b7280;font-size:13px}
+#status{white-space:pre-wrap;line-height:1.5}
+</style>
+</head>
+<body>
+<main>
+<div class="card">
+<h1>Pitch Motion Web</h1>
+<div class="muted">投球動作解析・試作版</div>
+<p>動画を選択すると、ブラウザ上で人体骨格を推定します。動画そのものをサーバーへアップロードする処理はありません。</p>
+<div class="row">
+<input id="videoFile" type="file" accept="video/*">
+<button id="start" disabled>解析開始</button>
+<button id="pause" disabled>停止 / 再開</button>
+</div>
+<p id="status">動画を選択してください。</p>
+</div>
+
+<div class="card">
+<div id="stage"><video id="video" playsinline controls></video><canvas id="overlay"></canvas></div>
+</div>
+
+<div class="card">
+<h2>現在値</h2>
+<div class="grid">
+<div class="metric">右肘角度<br><b id="elbow">—</b></div>
+<div class="metric">左肘角度<br><b id="lelbow">—</b></div>
+<div class="metric">右膝角度<br><b id="knee">—</b></div>
+<div class="metric">左膝角度<br><b id="lknee">—</b></div>
+<div class="metric">体幹傾き<br><b id="trunk">—</b></div>
+</div>
+</div>
+</main>
+
+<script type="module">
+import {PoseLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22";
+
+const file=document.querySelector("#videoFile"), video=document.querySelector("#video");
+const canvas=document.querySelector("#overlay"), ctx=canvas.getContext("2d");
+const start=document.querySelector("#start"), pause=document.querySelector("#pause");
+const status=document.querySelector("#status");
+let landmarker=null, active=false, lastVideoTime=-1, objectUrl=null;
+
+file.addEventListener("change",()=>{
+  const f=file.files?.[0];
+  if(!f)return;
+  if(objectUrl)URL.revokeObjectURL(objectUrl);
+  objectUrl=URL.createObjectURL(f);
+  video.src=objectUrl;
+  start.disabled=false;
+  status.textContent="動画を読み込みました。「解析開始」を押してください。";
+});
+
+function angle(a,b,c){
+  const abx=a.x-b.x, aby=a.y-b.y, cbx=c.x-b.x, cby=c.y-b.y;
+  const den=Math.hypot(abx,aby)*Math.hypot(cbx,cby);
+  if(!den)return null;
+  return Math.acos(Math.max(-1,Math.min(1,(abx*cbx+aby*cby)/den)))*180/Math.PI;
+}
+function avg(a,b){return{x:(a.x+b.x)/2,y:(a.y+b.y)/2,z:(a.z+b.z)/2}}
+const edges=[[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+
+function draw(points){
+  const w=canvas.width,h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.lineWidth=3;
+  for(const [i,j] of edges){
+    if(!points[i]||!points[j])continue;
+    ctx.beginPath();ctx.moveTo(points[i].x*w,points[i].y*h);ctx.lineTo(points[j].x*w,points[j].y*h);ctx.stroke();
+  }
+  for(const p of points){
+    ctx.beginPath();ctx.arc(p.x*w,p.y*h,4,0,Math.PI*2);ctx.fill();
+  }
+}
+function setMetric(id,v){document.getElementById(id).textContent=v==null?"—":v.toFixed(1)+"°"}
+
+async function createModel(){
+  status.textContent="AIモデルを読み込んでいます。初回だけ少し時間がかかります…";
+  const vision=await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
+  );
+  landmarker=await PoseLandmarker.createFromOptions(vision,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
+    },
+    runningMode:"VIDEO",
+    numPoses:1,
+    minPoseDetectionConfidence:.5,
+    minPosePresenceConfidence:.5,
+    minTrackingConfidence:.5
+  });
+}
+async function loop(){
+  if(active && !video.paused && !video.ended && video.currentTime!==lastVideoTime){
+    if(video.videoWidth && video.videoHeight){
+      canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+      const result=landmarker.detectForVideo(video,performance.now());
+      if(result.landmarks?.length){
+        const p=result.landmarks[0]; draw(p);
+        setMetric("elbow",angle(p[12],p[14],p[16]));
+        setMetric("lelbow",angle(p[11],p[13],p[15]));
+        setMetric("knee",angle(p[24],p[26],p[28]));
+        setMetric("lknee",angle(p[23],p[25],p[27]));
+        const s=avg(p[11],p[12]), h=avg(p[23],p[24]);
+        document.getElementById("trunk").textContent=(Math.atan2(s.x-h.x,h.y-s.y)*180/Math.PI).toFixed(1)+"°";
+      }
+      lastVideoTime=video.currentTime;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+start.addEventListener("click",async()=>{
+  try{
+    if(!landmarker)await createModel();
+    active=true;pause.disabled=false;
+    status.textContent="解析中。動画を再生すると骨格が表示されます。";
+    await video.play();
+  }catch(e){
+    status.textContent="解析を開始できませんでした。\n"+e.message+
+      "\n\nこのページはHTTPSで開く必要があります。";
+  }
+});
+pause.addEventListener("click",()=>{
+  if(video.paused){video.play();active=true}else{video.pause();active=false}
+});
+video.addEventListener("loadedmetadata",()=>{canvas.width=video.videoWidth;canvas.height=video.videoHeight});
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
